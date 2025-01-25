@@ -1,11 +1,15 @@
 package com.example.vmics
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -38,10 +42,13 @@ import com.example.vmics.ui.theme.VmicsTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.NetworkInterface
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.sin
 
 
@@ -150,27 +157,67 @@ class MainActivity : ComponentActivity() {
 
 
     private fun toggleSpeaker() {
+        // Check if permissions are granted to access audio features
         if (!hasPermissions()) {
             Toast.makeText(this, "Permissions not granted", Toast.LENGTH_LONG).show()
             return
         }
 
+        // Get the AudioManager system service to control audio settings
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        // If the speaker is not currently on, turn it on
         if (!isSpeakerOn.value) {
             CoroutineScope(Dispatchers.IO).launch {
-                val success = startUdpReceiving()
+                // Start receiving audio over UDP (this will handle the streaming process)
+                val success = startUdpReceiving()  // This should handle UDP audio receiving
+
+                // Update UI on the main thread
                 runOnUiThread {
                     if (success) {
+                        // For Android 12+ (API level 31+), use setCommunicationDevice()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            // Set the communication device to the built-in speaker
+                            val device = audioManager.availableCommunicationDevices
+                                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                            device?.let {
+                                audioManager.setCommunicationDevice(it)
+                            }
+                        } else {
+                            // For older Android versions, use the deprecated method to enable speakerphone
+                            @Suppress("DEPRECATION")
+                            audioManager.isSpeakerphoneOn = true
+                        }
+
+                        // Mark the speaker as being on and update UI
                         isSpeakerOn.value = true
                         Toast.makeText(this@MainActivity, "Speaker On", Toast.LENGTH_SHORT).show()
                     } else {
+                        // If starting UDP receiving fails, show a failure message
                         Toast.makeText(this@MainActivity, "Failed to start speaker", Toast.LENGTH_LONG).show()
                     }
                 }
             }
         } else {
-            stopUdpReceiving() // Stop speaker properly
+            // If the speaker is already on, turn it off
+            stopUdpReceiving()  // Stop audio streaming
+
+            // For Android 12+, reset the communication device to the default
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            } else {
+                // For older Android versions, disable speakerphone
+                @Suppress("DEPRECATION")
+                audioManager.isSpeakerphoneOn = false
+            }
+
+            // Mark the speaker as being off and update UI
+            isSpeakerOn.value = false
+            Toast.makeText(this@MainActivity, "Speaker Off", Toast.LENGTH_SHORT).show()
         }
     }
+
+
 
     // New function to properly stop receiving audio
     private fun stopUdpReceiving() {
@@ -208,6 +255,64 @@ class MainActivity : ComponentActivity() {
         val socket = DatagramSocket()
         socket.send(packet)
         socket.close()
+    }
+
+    private fun startListeningForBeep() {
+        // Start listening for UDP packets (containing the beep sound)
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val socket = DatagramSocket(udpPort)
+                val buffer = ByteArray(1024)
+                val packet = DatagramPacket(buffer, buffer.size)
+
+                while (isReceiving && isSpeakerOn.value) {
+                    socket.receive(packet)
+
+                    // Convert byte data to ShortArray
+                    val shortArray = byteArrayToShortArray(packet.data)
+
+                    // Check if it's a beep (you could implement a more sophisticated check)
+                    if (isBeep(shortArray)) {
+                        playBeepSound(shortArray)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("BeepListener", "Error: ${e.message}")
+            }
+        }
+    }
+
+    private fun byteArrayToShortArray(byteArray: ByteArray): ShortArray {
+        val shortBuffer = ByteBuffer.wrap(byteArray).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        return ShortArray(shortBuffer.remaining()).also { shortBuffer.get(it) }
+    }
+
+    private fun isBeep(shortArray: ShortArray): Boolean {
+        // Implement a method to check if the received sound is a beep (e.g., check frequency or pattern)
+        // For simplicity, you might check if the amplitude exceeds a threshold or other pattern characteristics.
+        return shortArray.isNotEmpty() // Replace with actual logic
+    }
+
+    private fun playBeepSound(beep: ShortArray) {
+        val bufferSize = beep.size * 2 // Each Short takes 2 bytes
+
+        // Use AudioTrack or any suitable method to play the beep sound
+        val audioTrack = AudioTrack.Builder()
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(44100)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(bufferSize) // 2 bytes per Short
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+
+        audioTrack.play()
+        audioTrack.write(beep, 0, beep.size)
+        audioTrack.stop()
+        audioTrack.release()
     }
 
 
@@ -369,8 +474,9 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val bufferSize = AudioRecord.getMinBufferSize(
-            44100, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        val bufferSize = maxOf(
+            AudioRecord.getMinBufferSize(44100, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT),
+            2048 // Ensure buffer is at least 2048 bytes
         )
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -379,6 +485,7 @@ class MainActivity : ComponentActivity() {
         }
 
         CoroutineScope(Dispatchers.IO).launch {
+
             try{
                 val audioRecord = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
@@ -394,6 +501,9 @@ class MainActivity : ComponentActivity() {
 
                 audioRecord.startRecording()
                 val buffer = ByteArray(bufferSize)
+
+                // Start listening for beep when mic is turned on
+                startListeningForBeep()
 
                 while (isStreaming.value) {
                     val read = audioRecord.read(buffer, 0, buffer.size)
@@ -443,6 +553,10 @@ class MainActivity : ComponentActivity() {
             var socket: DatagramSocket? = null
 
             try {
+                val bufferSize = AudioTrack.getMinBufferSize(
+                    44100, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                )
+
                 audioTrack = AudioTrack.Builder()
                     .setAudioFormat(
                         AudioFormat.Builder()
@@ -451,31 +565,35 @@ class MainActivity : ComponentActivity() {
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .build()
                     )
-                    .setBufferSizeInBytes(AudioTrack.getMinBufferSize(
-                        44100, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
-                    ))
+                    .setBufferSizeInBytes(bufferSize)
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build()
 
                 audioTrack.play()
 
                 socket = DatagramSocket(udpPort)
-                val buffer = ByteArray(1024)
+                val buffer = ByteArray(bufferSize)
+                val packet = DatagramPacket(buffer, buffer.size)
 
-                while (isReceiving && isSpeakerOn.value) { // Added proper exit condition
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    try {
-                        socket.receive(packet)
-                        if (packet.length > 0) {
-                            audioTrack.write(packet.data, 0, packet.length)
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                        break
+                while (isReceiving && isSpeakerOn.value) {
+                    socket.receive(packet)
+
+                    // Convert received ByteArray to ShortArray
+                    val shortArray = byteArrayToShortArray(packet.data)
+
+                    // Play the beep sound if it's a valid beep
+                    if (isBeep(shortArray)) {
+                        CoroutineScope(Dispatchers.Main).launch { playBeepSound(shortArray) }
                     }
+
+                    // Play received audio data
+                    audioTrack.write(shortArray, 0, shortArray.size)
+                    // Optional: Add a delay to reduce CPU usage if needed
+                    yield()
+
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e("UDPReceiver", "Error: ${e.message}")
             } finally {
                 isReceiving = false
                 audioTrack?.run {
@@ -488,6 +606,8 @@ class MainActivity : ComponentActivity() {
 
         return true
     }
+
+
 
 
 }
@@ -508,6 +628,7 @@ fun MicSpeakerControls(
 
 ) {
     val udpPortText = remember { mutableStateOf(udpPort.toString()) }
+    val isValidPort = udpPortText.value.toIntOrNull() != null
 
 
 
@@ -550,7 +671,8 @@ fun MicSpeakerControls(
                     val newPort = udpPortText.value.toIntOrNull() ?: udpPort
                     onPortChanged(newPort)
                 },
-                modifier = Modifier.align(Alignment.CenterVertically)
+                modifier = Modifier.align(Alignment.CenterVertically) ,
+                enabled = isValidPort
             ) {
                 Text(text = "Change Port")
             }
