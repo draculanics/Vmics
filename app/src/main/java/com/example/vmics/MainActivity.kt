@@ -7,6 +7,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -41,6 +42,8 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.NetworkInterface
+import kotlin.math.sin
+
 
 class MainActivity : ComponentActivity() {
 
@@ -50,6 +53,9 @@ class MainActivity : ComponentActivity() {
     private var isSpeakerOn = mutableStateOf(false)
     private val discoveredDevices = mutableStateListOf<String>()
     private var isReceiving = false
+    private val targetAddress: InetAddress = InetAddress.getByName("255.255.255.255") // Replace with actual target address
+    private val beep = generateBeepSound()
+
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -79,7 +85,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val localIp = getLocalIpAddress() ?: "Unknown"
+        val localIp = getLocalIpAddress()
 
         if (!hasPermissions()) {
             permissionLauncher.launch(
@@ -128,6 +134,8 @@ class MainActivity : ComponentActivity() {
         if (hasPermissions()) {
             if (!isStreaming.value) {
                 isStreaming.value = true
+                // Send the beep sound over UDP
+                sendBeepSound(targetAddress, udpPort, beep)
                 startUdpStreaming() // Start only when user presses the mic button
             } else {
                 isStreaming.value = false
@@ -142,7 +150,12 @@ class MainActivity : ComponentActivity() {
 
 
     private fun toggleSpeaker() {
-        if (hasPermissions()) {
+        if (!hasPermissions()) {
+            Toast.makeText(this, "Permissions not granted", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        if (!isSpeakerOn.value) {
             CoroutineScope(Dispatchers.IO).launch {
                 val success = startUdpReceiving()
                 runOnUiThread {
@@ -155,10 +168,47 @@ class MainActivity : ComponentActivity() {
                 }
             }
         } else {
-            Toast.makeText(this, "Permissions not granted", Toast.LENGTH_LONG).show()
+            stopUdpReceiving() // Stop speaker properly
         }
     }
 
+    // New function to properly stop receiving audio
+    private fun stopUdpReceiving() {
+        isSpeakerOn.value = false
+        isReceiving = false // Ensures next start works
+        Toast.makeText(this@MainActivity, "Speaker Off", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun generateBeepSound(): ShortArray {
+        val sampleRate = 44100
+        val durationMs = 200  // Beep duration in milliseconds
+        val numSamples = (durationMs / 1000.0 * sampleRate).toInt()
+        val generatedSound = ShortArray(numSamples)
+
+        val frequency = 1000.0 // Hz (beep frequency)
+        for (i in generatedSound.indices) {
+            val angle = 2.0 * Math.PI * i * frequency / sampleRate
+            generatedSound[i] = (Short.MAX_VALUE * sin(angle)).toInt().toShort()
+        }
+        return generatedSound
+    }
+
+    private fun sendBeepSound(targetAddress: InetAddress, udpPort: Int, beep: ShortArray) {
+        // Convert ShortArray to ByteArray
+        val byteArray = ByteArray(beep.size * 2)  // 2 bytes per Short
+        for (i in beep.indices) {
+            byteArray[i * 2] = (beep[i].toInt() shr 8).toByte()   // High byte
+            byteArray[i * 2 + 1] = (beep[i].toInt() and 0xFF).toByte()  // Low byte
+        }
+
+        // Create the DatagramPacket with the converted ByteArray
+        val packet = DatagramPacket(byteArray, byteArray.size, targetAddress, udpPort)
+
+        // Send the packet via UDP
+        val socket = DatagramSocket()
+        socket.send(packet)
+        socket.close()
+    }
 
 
     private fun startDiscoveryResponder() {
@@ -226,50 +276,43 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun getLocalIpAddress(): String? {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            for (networkInterface in interfaces) {
-                val addresses = networkInterface.inetAddresses
-                for (address in addresses) {
-                    // Check if the address is not loopback and is an IPv4 address
-                    if (!address.isLoopbackAddress && address.hostAddress?.contains(':') == false) {
-                        return address.hostAddress
-                    }
-                }
-            }
+    private fun getLocalIpAddress(): String {
+        return try {
+            NetworkInterface.getNetworkInterfaces().toList().flatMap { it.inetAddresses.toList() }
+                .firstOrNull { !it.isLoopbackAddress && it.hostAddress?.contains(':') == false }
+                ?.hostAddress ?: "No Network"
         } catch (e: Exception) {
-            e.printStackTrace()
+            "No Network"
         }
-        return null
     }
 
 
+
+
     private fun startLocalAudioLoopback() {
+        if (!hasPermissions()) return
+
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             Toast.makeText(this, "Permission to record audio is required", Toast.LENGTH_LONG).show()
             return
         }
 
-        val bufferSize = AudioRecord.getMinBufferSize(
-            44100, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-        )
-
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                val sampleRate = 44100
+                val bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                if (bufferSize == AudioRecord.ERROR || bufferSize == AudioRecord.ERROR_BAD_VALUE) return@launch
+
                 val audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    44100,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
+                    MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, bufferSize
                 )
 
                 val audioTrack = AudioTrack.Builder()
                     .setAudioFormat(
                         AudioFormat.Builder()
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(44100)
+                            .setSampleRate(sampleRate)
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .build()
                     )
@@ -281,7 +324,6 @@ class MainActivity : ComponentActivity() {
                 audioTrack.play()
 
                 val buffer = ByteArray(bufferSize)
-
                 while (isStreaming.value) {
                     val read = audioRecord.read(buffer, 0, buffer.size)
                     if (read > 0) {
@@ -293,12 +335,18 @@ class MainActivity : ComponentActivity() {
                 audioRecord.release()
                 audioTrack.stop()
                 audioTrack.release()
+
             } catch (e: Exception) {
                 e.printStackTrace()
-                Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Loopback error: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
+
+
+
 
     private fun isNetworkAvailable(): Boolean {
         return try {
@@ -313,6 +361,9 @@ class MainActivity : ComponentActivity() {
         if (!hasPermissions()) return
 
         if (!isNetworkAvailable()) {
+            runOnUiThread {
+                Toast.makeText(this, "No network found, using to local loopback.", Toast.LENGTH_SHORT).show()
+            }
             // No network detected, start local loopback
             startLocalAudioLoopback()
             return
@@ -390,7 +441,6 @@ class MainActivity : ComponentActivity() {
         CoroutineScope(Dispatchers.IO).launch {
             var audioTrack: AudioTrack? = null
             var socket: DatagramSocket? = null
-            var receivedAudio = false
 
             try {
                 audioTrack = AudioTrack.Builder()
@@ -412,20 +462,15 @@ class MainActivity : ComponentActivity() {
                 socket = DatagramSocket(udpPort)
                 val buffer = ByteArray(1024)
 
-                val startTime = System.currentTimeMillis()
-                while (isSpeakerOn.value && isReceiving) {
+                while (isReceiving && isSpeakerOn.value) { // Added proper exit condition
                     val packet = DatagramPacket(buffer, buffer.size)
                     try {
                         socket.receive(packet)
                         if (packet.length > 0) {
-                            receivedAudio = true
                             audioTrack.write(packet.data, 0, packet.length)
                         }
                     } catch (e: Exception) {
                         e.printStackTrace()
-                        break
-                    }
-                    if (!receivedAudio && System.currentTimeMillis() - startTime > 5000) {
                         break
                     }
                 }
@@ -443,6 +488,7 @@ class MainActivity : ComponentActivity() {
 
         return true
     }
+
 
 }
 
@@ -523,13 +569,21 @@ fun MicSpeakerControls(
 
         // Mic toggle button
         Button(
-            onClick = { onToggleStreaming() },  // Directly toggle streaming
+            onClick = {
+                try {
+                    onToggleStreaming()  // Call function inside try-catch
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    Log.e("MicToggle", "Error: ${e.message}")
+                }
+            },
             modifier = Modifier
                 .padding(top = 16.dp)
                 .size(150.dp, 60.dp)
         ) {
-            Text(text = if (isStreaming) "Stop Mic" else "Start Mic")  // Correct label update
+            Text(text = if (isStreaming) "Stop Mic" else "Start Mic")
         }
+
 
 
         // Speaker toggle button
