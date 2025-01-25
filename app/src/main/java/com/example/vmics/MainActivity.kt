@@ -430,6 +430,8 @@ class MainActivity : ComponentActivity() {
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build()
 
+                // Set playback volume to 50% to reduce feedback suppression
+                audioTrack.setVolume(AudioTrack.getMaxVolume() * 0.5f)
                 audioRecord.startRecording()
                 audioTrack.play()
 
