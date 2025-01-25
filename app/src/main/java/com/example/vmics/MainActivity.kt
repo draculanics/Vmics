@@ -30,11 +30,13 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -42,7 +44,9 @@ import com.example.vmics.ui.theme.VmicsTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -173,7 +177,7 @@ class MainActivity : ComponentActivity() {
                 val success = startUdpReceiving()  // This should handle UDP audio receiving
 
                 // Update UI on the main thread
-                runOnUiThread {
+                withContext(Dispatchers.Main) {
                     if (success) {
                         // For Android 12+ (API level 31+), use setCommunicationDevice()
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -405,8 +409,9 @@ class MainActivity : ComponentActivity() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val sampleRate = 44100
-                val bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                if (bufferSize == AudioRecord.ERROR || bufferSize == AudioRecord.ERROR_BAD_VALUE) return@launch
+                val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                val bufferSize = if (minBufferSize > 0) minBufferSize else sampleRate * 2  // Fallback buffer size
+
 
                 val audioRecord = AudioRecord(
                     MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO,
@@ -629,7 +634,17 @@ fun MicSpeakerControls(
 ) {
     val udpPortText = remember { mutableStateOf(udpPort.toString()) }
     val isValidPort = udpPortText.value.toIntOrNull() != null
+    val context = LocalContext.current
+    val showToast = remember { mutableStateOf(false) }
+    val toastMessage = remember { mutableStateOf("") }
 
+    // Display toast if needed
+    if (showToast.value) {
+        LaunchedEffect(toastMessage.value) {
+            Toast.makeText(context, toastMessage.value, Toast.LENGTH_LONG).show()
+            showToast.value = false // Reset toast visibility flag after showing it
+        }
+    }
 
 
     Column(
@@ -697,6 +712,15 @@ fun MicSpeakerControls(
                 } catch (e: Exception) {
                     e.printStackTrace()
                     Log.e("MicToggle", "Error: ${e.message}")
+                }catch (e: Exception) {
+                e.printStackTrace()
+                Log.e("MicToggle", "Error: ${e.message}")
+                toastMessage.value = "Error: ${e.message}" // Show error message in toast
+                showToast.value = true
+                } catch (e: IOException) {
+                    Log.e("MicToggle", "IO error: ${e.message}", e)
+                } catch (e: Exception) {
+                    Log.e("MicToggle", "Unknown error: ${e.message}", e)
                 }
             },
             modifier = Modifier
