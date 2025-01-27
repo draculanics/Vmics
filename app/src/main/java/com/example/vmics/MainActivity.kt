@@ -470,7 +470,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startUdpStreaming() {
-        if (!hasPermissions()) return
+        if (!hasPermissions()) {
+            runOnUiThread {
+                Toast.makeText(this, "Permissions not granted", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
 
         if (!isNetworkAvailable()) {
             runOnUiThread {
@@ -590,7 +595,7 @@ class MainActivity : ComponentActivity() {
 
                     // Play the beep sound if it's a valid beep
                     if (isBeep(shortArray)) {
-                        CoroutineScope(Dispatchers.Main).launch { playBeepSound(shortArray) }
+                        runOnUiThread { playBeepSound(shortArray) }
                     }
 
                     // Play received audio data
